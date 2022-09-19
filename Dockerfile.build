@@ -1,0 +1,59 @@
+### Build
+FROM node:lts-alpine AS builder
+
+WORKDIR /app
+
+ARG SSH_KEY
+ENV SSH_KEY=$SSH_KEY
+
+COPY . .
+
+RUN apk add git openssh-client
+
+RUN mkdir -p -m 0600 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+# Install nestJS cli (required to build)
+RUN npm install -g @nestjs/cli
+
+RUN ssh-agent sh -c 'echo $SSH_KEY | base64 -d | ssh-add - ; yarn install'
+
+RUN yarn build
+
+
+### Server
+FROM node:lts-alpine AS server
+
+ARG VERSION
+ENV VERSION=$VERSION
+
+WORKDIR /app
+
+COPY package* ./
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+
+# Remove dangerous packages
+RUN apk upgrade
+RUN apk del curl
+
+# Create the group that is going to run the application
+RUN addgroup -S www && adduser -S appuser -G www
+
+# Create log folder since ts does not copy empty folder structure
+RUN mkdir /app/logs
+
+# Set the group for the entire application
+RUN chgrp -R www /app
+
+# Update the application permissions to read only
+RUN chmod -R g+xr /app
+
+# Update the logs folder directory permissions to read and write
+RUN chmod -R g+xrw /app/logs
+
+USER appuser
+
+EXPOSE 3000
+
+CMD ["npm", "run", "start:prod"]
