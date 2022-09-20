@@ -1,0 +1,128 @@
+# This workflow will build  new container image to Amazon ECR and send Signal back to Cloudformation to deploy ECS fargate env
+on:
+  push:
+    tags:
+      - v[0-99].[0-99].[0-99]
+name: Development build and push to ecr
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: tag number
+        id: git-tag
+        run: |
+          echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\//}
+      - name: tagged environment
+        id: tagged-environment
+        env:
+          REF: ${{ github.event.base_ref }}
+        run: |
+          declare -a branchToEnvironment
+
+          ref="$REF"
+
+          branchName="${ref//refs\/heads\//}"
+
+          echo ::set-output name=BRANCH_ENV::${branchName}
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ steps.git-tag.outputs.VERSION }}
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: test --org=my-e17 --sarif-file-output=snyk.sarif
+      - name: 'Upload Artifact'
+        uses: actions/upload-artifact@v2
+        with:
+          name: results.sarif
+          path: snyk.sarif
+          retention-days: 5
+      - name: Upload snyk report to s3
+        uses: zdurham/s3-upload-github-action@master
+        with:
+          args: --acl public-read
+        env:
+          FILE: ./snyk.sarif
+          AWS_REGION: 'eu-east-1'
+          S3_BUCKET: 'my-vulnerability-reports'
+          S3_KEY: 'notification-service-${{ steps.git-tag.outputs.VERSION }}/snyk.sarif'
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Run Snyk to Monitor to deliver tests to snyk dashboard
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: monitor --org=my-e17
+      - name: SonarCloud Scan
+        uses: sonarsource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=my-private
+            -Dsonar.projectKey=my-notification-service
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-east-1
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Get short SHA
+        id: slug
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: echo "::set-output name=sha7::$(echo ${IMAGE_TAG::7})"
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: notification-service
+          SSH_KEY: ${{ secrets.GITHUB_SSH_KEY }}
+          BRANCH_ENV: ${{ steps.tagged-environment.outputs.BRANCH_ENV }}
+        run: |
+          # Build a docker container and
+          # push it to ECR so that it can
+          # be deployed to ECS Fargate.
+          docker build --file Dockerfile.build --build-arg SSH_KEY=${SSH_KEY} --build-arg VERSION=${{ steps.git-tag.outputs.VERSION }}  -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.git-tag.outputs.VERSION }}-${BRANCH_ENV} --no-cache .
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY} --all-tags
+          echo "::set-output name=image::${ECR_REGISTRY}/${ECR_REPOSITORY}:${{ steps.git-tag.outputs.VERSION }}-${BRANCH_ENV}"
+
+      - name: EKS Deploy - Update replication controller
+        uses: ianbelcher/eks-kubectl-action@master
+        with:
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_region: eu-east-1
+          cluster_name: development
+          args: set image replicationcontroller/notification-service notification-service=${{ steps.build-image.outputs.image }} -n notification-service
+      - name: EKS Deploy - Delete pods
+        uses: ianbelcher/eks-kubectl-action@master
+        with:
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_region: eu-east-1
+          cluster_name: development
+          args: delete pod -n notification-service -l app=notification-service
+
+      - name: Slack Notification
+        if: ${{ always() }}
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_CHANNEL: devops
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_ICON: https://my-backet.s3-eu-east-1.amazonaws.com/MyIcon.png
+          SLACK_MESSAGE: 'NOTIFICATION SERVICE Job status: ${{ job.status }}'
+          SLACK_TITLE: Post Title
+          SLACK_USERNAME: my-username
+          SLACK_WEBHOOK: ${{ secrets.DEVOPS_SLACK_WEBHOOK }}
