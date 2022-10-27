@@ -1,4 +1,4 @@
-# docker-build
+# docker-build fo NodeJS app
 
 This repo contains  files:
 - Dockerfile
